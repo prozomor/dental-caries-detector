@@ -1,5 +1,4 @@
 # --- Grad-CAM: خريطة حرارية تُظهر أين نظر النموذج (المهمة B3) ---
-
 import os, sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
 import numpy as np
@@ -10,24 +9,29 @@ from train_model import MODEL_PATH, IMAGE_SIZE, preprocess_image
 def make_gradcam(image_path, model=None):
     if model is None:
         model = tf.keras.models.load_model(MODEL_PATH)
-    # آخر طبقة خرجها رباعي الأبعاد = القاعدة المدرّبة (خرجه آخر خريطة التفافية 7x7)
-    layer_name = None
-    for layer in reversed(model.layers):
-        if len(layer.output_shape) == 4:
-            layer_name = layer.name
+    # القاعدة = الطبقة المتداخلة من نوع Model، والرأس = كل الطبقات بعدها بالترتيب
+    base, idx = None, -1
+    for i, layer in enumerate(model.layers):
+        if isinstance(layer, tf.keras.Model):
+            base, idx = layer, i
             break
-    grad_model = tf.keras.models.Model(
-        model.inputs, [model.get_layer(layer_name).output, model.output])
+    if base is None:
+        raise RuntimeError("Grad-CAM: لم تُوجد القاعدة المتداخلة داخل النموذج")
+    head = model.layers[idx + 1:]
+
     arr = preprocess_image(image_path)
     with tf.GradientTape() as tape:
-        conv_out, preds = grad_model(arr)
-        p = preds[0][0]
-        # نشرح الفئة التي اختارها النموذج فعلاً (لا دائماً healthy)
-        score = tf.where(p > 0.5, p, 1.0 - p)
-    grads = tape.gradient(score, conv_out)
+        conv = base(arr, training=False)     # آخر خريطة التفافية 7x7
+        tape.watch(conv)
+        x = conv
+        for layer in head:                   # نموذج خطي: نمر بالرأس طبقة طبقة
+            x = layer(x)
+        p = x[0][0]
+        score = tf.where(p > 0.5, p, 1.0 - p)   # نشرح الفئة المختارة فعلاً
+    grads = tape.gradient(score, conv)
     weights = tf.reduce_mean(grads, axis=(1, 2))
-    heatmap = tf.reduce_sum(conv_out[0] * weights, axis=-1)
-    heatmap = tf.nn.relu(heatmap).numpy()      # ReLU ثم تحويل numpy بطريقة صحيحة
+    heatmap = tf.reduce_sum(conv[0] * weights, axis=-1)
+    heatmap = tf.nn.relu(heatmap).numpy()
     if heatmap.max() > 0:
         heatmap = heatmap / heatmap.max()
     heatmap = tf.image.resize(heatmap[..., None], (IMAGE_SIZE, IMAGE_SIZE))[..., 0].numpy()
